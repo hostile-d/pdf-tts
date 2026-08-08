@@ -1,26 +1,28 @@
 """
-Step 1 of 2 — PDF -> cleaned text extraction
+Step 1 of 2 — PDF -> cleaned, chapter-split text files
 
-Extracts text from a Russian PDF and cleans it up for TTS:
-    - strips repeating running headers/footers (detected by position)
-    - strips bare page numbers
-    - strips table-of-contents dot-leaders ( . . . . )
-    - rejoins hyphenated line breaks
-    - preserves paragraph breaks
+Extracts text from a Russian PDF, cleans it (strips running headers/footers,
+page numbers, TOC dot-leaders, data tables), and splits it into one file per
+chapter based on detected "Глава N" / "Часть N" markers in the page layout.
 
 Usage:
     python extract_text.py
 
 Output:
-    book_clean.txt — review/edit this before running generate_audio.py
+    ./output/text/00_<title>.txt, 01_<title>.txt, ... one file per chapter
+    (chapter 00 is front matter — dedication/preface/intro before "Глава 1")
 """
 
 import fitz  # pymupdf
 import re
+import os
 from collections import Counter
 
 PDF_PATH = "book.pdf"
-CLEAN_TEXT_PATH = "book_clean.txt"
+TEXT_OUTPUT_DIR = "output/text"
+
+MARKER_RE = re.compile(r'^(Часть|Глава)\s+([IVXLCDM]+|\d+)\.?\s*$')
+MIN_CHAPTER_CHARS = 300  # chapters shorter than this (e.g. a bare Part divider) get merged into the next one
 
 
 def normalize(line):
@@ -29,34 +31,35 @@ def normalize(line):
     return s
 
 
-def is_table_line(line):
-    """Table rows extracted from PDFs sometimes contain multiple runs of 2+
-    spaces (column gaps) — a secondary, weaker signal alongside block detection."""
-    gaps = re.findall(r' {2,}', line)
-    return len(gaps) >= 2 and len(line.strip()) > 30
+def is_title_block(block_text):
+    """True if a block's letters are entirely uppercase — used to identify
+    chapter/section title blocks (as opposed to running headers, which mix case)."""
+    stripped = re.sub(r'[\d\s.,:;\-–—«»!?]', '', block_text)
+    if len(stripped) < 4:
+        return False
+    return stripped == stripped.upper() and any(c.isalpha() for c in stripped)
 
 
 def looks_like_toc_entry(line):
-    """A line that's mostly a short title ending in a page number,
-    e.g. 'Глава 3. В ловушке контрзависимости 84' — common in TOC pages
-    even without dot-leaders."""
     s = line.strip()
     if not s or len(s) > 90:
         return False
     return bool(re.match(r'^.{3,80}?\s\d{1,4}$', s)) and not s.endswith(('.', '!', '?'))
 
 
+def is_toc_page(lines):
+    non_empty = [l for l in lines if l.strip()]
+    if len(non_empty) < 5:
+        return False
+    toc_like = sum(1 for l in non_empty if looks_like_toc_entry(l))
+    return toc_like / len(non_empty) > 0.5
+
+
 def strip_part_title_runs(text):
-    """Some front-matter pages list 'Часть I ... Часть II ... Часть III ...'
-    as a single full-width block (not a real two-column table), so the
-    block-position table detector misses it. Find chains of 2+ consecutive
-    'Часть <N/roman>' markers with short title text between them and strip
-    the whole chain, including the trailing title after the last marker."""
     marker_re = re.compile(r'Часть\s+(?:\d{1,2}|[IVXLCDM]+)\.?\s+')
     matches = list(marker_re.finditer(text))
     if len(matches) < 2:
         return text
-
     to_remove = []
     i = 0
     while i < len(matches) - 1:
@@ -67,80 +70,20 @@ def strip_part_title_runs(text):
                 j += 1
             else:
                 break
-        if j > i:  # found a chain of 2+ consecutive markers
+        if j > i:
             to_remove.append((matches[i].start(), matches[j].end()))
             i = j + 1
         else:
             i += 1
-
     for start, end in sorted(to_remove, reverse=True):
         text = text[:start] + text[end:]
+    text = re.sub(r'\s+([.,!?])', r'\1', text)  # cleanup stray space before punctuation left by removal
     return text
 
 
-def is_toc_page(lines):
-    """Flag a whole page as table-of-contents if most of its non-empty
-    lines look like TOC entries."""
-    non_empty = [l for l in lines if l.strip()]
-    if len(non_empty) < 5:
-        return False
-    toc_like = sum(1 for l in non_empty if looks_like_toc_entry(l))
-    return toc_like / len(non_empty) > 0.5
-
-
-def get_page_text_with_tables_stripped(doc):
-    """Use block positions (not just text) to find and drop data tables.
-    A real prose paragraph block spans close to the page's full text-column
-    width; table cells are narrow, irregular-width blocks, and a genuine
-    multi-column table also has at least one block shifted right into a
-    second column. Detecting that shift flags the page as containing a
-    table, and on that page we drop every block that isn't full-width
-    prose (which safely removes cell text, row/column headers, and labels
-    without touching normal paragraphs elsewhere)."""
-    from collections import Counter
-    widths = Counter()
-    margins = Counter()
-    for page in doc:
-        for b in page.get_text("blocks"):
-            x0, y0, x1, y1, text, bno, btype = b
-            if btype != 0:
-                continue
-            widths[round((x1 - x0) / 5) * 5] += 1
-            margins[round(x0 / 5) * 5] += 1
-    standard_width = widths.most_common(1)[0][0]
-    standard_margin = margins.most_common(1)[0][0]
-
-    pages_lines = []
-    for page in doc:
-        blocks = [b for b in page.get_text("blocks") if b[6] == 0]
-        has_second_column = any(
-            b[0] > standard_margin + 50 for b in blocks
-        )
-        if has_second_column:
-            # table page: keep only genuinely full-width paragraph blocks
-            blocks = [b for b in blocks if (b[2] - b[0]) >= 0.85 * standard_width]
-        blocks.sort(key=lambda b: (b[1], b[0]))  # reading order: top-to-bottom, left-to-right
-        text = "\n".join(b[4] for b in blocks)
-        pages_lines.append(text.split("\n"))
-    return pages_lines
-
-
-def extract_clean_text(pdf_path):
-    doc = fitz.open(pdf_path)
-    pages_lines = get_page_text_with_tables_stripped(doc)
-
-    # detect running headers/footers by position (top 3 / bottom 2 lines of each page)
-    pos_counter = Counter()
-    for lines in pages_lines:
-        top = lines[:3]
-        bottom = lines[-2:]
-        for l in set(top + bottom):
-            norm = normalize(l)
-            if norm and len(norm) < 90:
-                pos_counter[norm] += 1
-
-    running_heads = {norm for norm, c in pos_counter.items() if c >= 6}
-
+def clean_block_text_list(blocks_text_list, running_heads):
+    """Apply line-level junk filtering (headers, page numbers, TOC dots)
+    and paragraph/dehyphenation cleanup to a list of raw block texts."""
     page_num_re = re.compile(r'^\d{1,4}$')
     toc_dots_re = re.compile(r'\.\s*\.\s*\.\s*\.')
 
@@ -152,42 +95,197 @@ def extract_clean_text(pdf_path):
             return True
         if toc_dots_re.search(s):
             return True
-        if is_table_line(line):
-            return True
         if normalize(s) in running_heads:
             return True
         return False
 
-    cleaned_pages = []
-    dropped_toc_pages = 0
-    for lines in pages_lines:
-        if is_toc_page(lines):
-            dropped_toc_pages += 1
-            continue  # skip the whole page, it's a table of contents
-        kept = [l for l in lines if not is_junk_line(l)]
-        cleaned_pages.append("\n".join(kept))
+    raw = "\n".join(blocks_text_list)
+    raw = fix_title_boundaries(raw)
+    lines = raw.split("\n")
+    kept = [l for l in lines if not is_junk_line(l)]
+    text = "\n".join(kept)
+    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+    text = re.sub(r'\n{2,}', '<PARA>', text)
+    text = re.sub(r'\n', ' ', text)
+    text = text.replace('<PARA>', '\n\n')
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = strip_part_title_runs(text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = normalize_for_tts(text)
+    return text.strip()
 
-    if dropped_toc_pages:
-        print(f"Dropped {dropped_toc_pages} page(s) detected as table of contents.")
 
-    full_text = "\n".join(cleaned_pages)
-    full_text = re.sub(r'(\w)-\n(\w)', r'\1\2', full_text)          # dehyphenate
-    full_text = re.sub(r'\n{2,}', '<PARA>', full_text)               # mark paragraph breaks
-    full_text = re.sub(r'\n', ' ', full_text)                        # join remaining line breaks
-    full_text = full_text.replace('<PARA>', '\n\n')
-    full_text = re.sub(r'[ \t]{2,}', ' ', full_text)
-    full_text = re.sub(r'\n{3,}', '\n\n', full_text)
-    full_text = strip_part_title_runs(full_text)
-    full_text = re.sub(r'[ \t]{2,}', ' ', full_text)  # cleanup any double-space left by the strip
-    return full_text.strip()
+def has_table_row(blocks):
+    """A real table has 2+ blocks sharing the same vertical row (side-by-side
+    columns). A centered epigraph or chapter marker is just offset horizontally
+    while stacked vertically — no row overlap — so this avoids false positives
+    that a simple 'x0 is far from the margin' check would trigger on."""
+    for i in range(len(blocks)):
+        for j in range(i + 1, len(blocks)):
+            b1, b2 = blocks[i], blocks[j]
+            y_overlap = min(b1[3], b2[3]) - max(b1[1], b2[1])
+            if y_overlap > 5:
+                return True
+    return False
+
+
+TITLE_START = "\uE000"
+TITLE_END = "\uE001"
+
+
+def format_block_for_body(block_text):
+    """Standalone section titles (ПРЕДИСЛОВИЕ, ВВЕДЕНИЕ, subheadings, etc.)
+    have no natural sentence punctuation, so without this they get fused
+    into the surrounding prose and TTS reads them as one run-on blob with
+    no pause on either side. Wrap them in sentinels here; fix_title_boundaries()
+    later inserts a period before AND after, so the sentence-splitter gets
+    real boundaries on both sides."""
+    if is_title_block(block_text):
+        clean = re.sub(r'\s+', ' ', block_text).strip().rstrip(':')
+        return f"{TITLE_START}{clean}.{TITLE_END}"
+    return block_text
+
+
+def fix_title_boundaries(text):
+    """Ensure a sentence-ending period precedes every title-marked span
+    (not just follows it), so titles never get glued onto the end of the
+    previous sentence."""
+    result = []
+    i = 0
+    while True:
+        idx = text.find(TITLE_START, i)
+        if idx == -1:
+            result.append(text[i:])
+            break
+        before = text[i:idx]
+        result.append(before)
+        stripped = before.rstrip()
+        if stripped and stripped[-1] not in '.!?':
+            result.append('.\n\n')
+        else:
+            result.append('\n\n')
+        end_idx = text.find(TITLE_END, idx)
+        title_text = text[idx + 1:end_idx]
+        result.append(title_text)
+        result.append('\n\n')
+        i = end_idx + 1
+    return ''.join(result)
+
+
+def normalize_for_tts(text):
+    """Strip characters that carry no spoken sound but that XTTS sometimes
+    tries to vocalize anyway, producing a click/glitch — every quote-mark
+    style (Russian guillemets, German-style low quotes, smart/curly quotes,
+    straight quotes). Just deleting them (not replacing with a pause) is
+    the standard audiobook-narration convention: a narrator doesn't speak
+    the quotation marks themselves."""
+    return re.sub(r'[«»„‚‹›‟"\u2018\u2019\u201c\u201d"\'`]', '', text)
+
+
+def slugify(title, max_len=50):
+    s = title.strip().lower()
+    s = re.sub(r'[^\w\s-]', '', s, flags=re.UNICODE)
+    s = re.sub(r'\s+', '_', s)
+    return s[:max_len].strip('_') or "untitled"
+
+
+def extract_chapters(pdf_path):
+    doc = fitz.open(pdf_path)
+
+    # --- pass 1: detect running headers/footers and standard column width (for table stripping) ---
+    pos_counter = Counter()
+    widths = Counter()
+    margins = Counter()
+    for page in doc:
+        lines = page.get_text().split("\n")
+        top, bottom = lines[:3], lines[-2:]
+        for l in set(top + bottom):
+            norm = normalize(l)
+            if norm and len(norm) < 90:
+                pos_counter[norm] += 1
+        for b in page.get_text("blocks"):
+            if b[6] != 0:
+                continue
+            widths[round((b[2] - b[0]) / 5) * 5] += 1
+            margins[round(b[0] / 5) * 5] += 1
+    running_heads = {norm for norm, c in pos_counter.items() if c >= 6}
+    standard_width = widths.most_common(1)[0][0]
+    standard_margin = margins.most_common(1)[0][0]
+
+    # --- pass 2: walk pages, split into chapters at Часть/Глава markers, strip tables ---
+    chapters = []  # list of (title, [block_text, ...])
+    current_title = "Введение"
+    current_blocks = []
+
+    for page in doc:
+        raw_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
+        raw_blocks.sort(key=lambda b: (b[1], b[0]))
+
+        # table detection: page has 2+ blocks sharing the same row (side-by-side columns)
+        if has_table_row(raw_blocks):
+            body_blocks = [b for b in raw_blocks if (b[2] - b[0]) >= 0.85 * standard_width]
+        else:
+            body_blocks = list(raw_blocks)
+
+        # TOC page check (uses full page text, not just filtered blocks)
+        all_lines = page.get_text().split("\n")
+        if is_toc_page(all_lines):
+            continue  # skip whole page
+
+        # chapter/part marker detection — only meaningful at top of page, before other body content
+        if body_blocks and MARKER_RE.match(body_blocks[0][4].strip()):
+            marker_text = body_blocks[0][4].strip()
+            consumed = 1
+            title = marker_text
+            if len(body_blocks) > 1 and is_title_block(body_blocks[1][4]):
+                title = body_blocks[1][4].strip().replace("\n", " ")
+                consumed = 2
+            # flush current chapter, start a new one
+            chapters.append((current_title, current_blocks))
+            current_title = title
+            current_blocks = [format_block_for_body(b[4]) for b in body_blocks[consumed:]]
+        else:
+            current_blocks.extend(format_block_for_body(b[4]) for b in body_blocks)
+
+    chapters.append((current_title, current_blocks))
+
+    # --- pass 3: clean each chapter's text, merge tiny chapters (e.g. bare Part dividers) forward ---
+    cleaned = []
+    for title, blocks_text_list in chapters:
+        text = clean_block_text_list(blocks_text_list, running_heads)
+        cleaned.append((title, text))
+
+    merged = []
+    pending_title = None
+    for title, text in cleaned:
+        if len(text) < MIN_CHAPTER_CHARS:
+            pending_title = title if pending_title is None else f"{pending_title} — {title}"
+            continue
+        if pending_title:
+            title = f"{pending_title} — {title}"
+            pending_title = None
+        merged.append((title, text))
+    if pending_title and merged:
+        # trailing tiny chapter with nothing after it: attach to the last real chapter
+        last_title, last_text = merged[-1]
+        merged[-1] = (f"{last_title} — {pending_title}", last_text)
+
+    return merged
 
 
 if __name__ == "__main__":
-    print(f"Extracting and cleaning text from {PDF_PATH}...")
-    text = extract_clean_text(PDF_PATH)
+    os.makedirs(TEXT_OUTPUT_DIR, exist_ok=True)
 
-    with open(CLEAN_TEXT_PATH, "w", encoding="utf-8") as f:
-        f.write(text)
+    print(f"Extracting and splitting {PDF_PATH} into chapters...")
+    chapters = extract_chapters(PDF_PATH)
 
-    print(f"Done. Clean text saved to {CLEAN_TEXT_PATH} ({len(text)} chars)")
-    print("Review/edit it if needed, then run: python generate_audio.py")
+    for i, (title, text) in enumerate(chapters):
+        slug = slugify(title)
+        out_path = os.path.join(TEXT_OUTPUT_DIR, f"{i:02d}_{slug}.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"  {out_path}  ({len(text)} chars)  — {title[:60]}")
+
+    print(f"\nDone. {len(chapters)} chapter file(s) written to {TEXT_OUTPUT_DIR}/")
+    print("Review/edit them if needed, then run: python generate_audio.py")
